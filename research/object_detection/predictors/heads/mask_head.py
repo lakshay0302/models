@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2017 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,12 +20,17 @@ Contains Mask prediction head classes for different meta architectures.
 All the mask prediction heads have a predict function that receives the
 `features` as the first argument and returns `mask_predictions`.
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import math
-import tensorflow as tf
+from six.moves import range
+import tensorflow.compat.v1 as tf
+import tf_slim as slim
 
 from object_detection.predictors.heads import head
-
-slim = tf.contrib.slim
+from object_detection.utils import ops
 
 
 class MaskRCNNMaskHead(head.Head):
@@ -41,7 +47,8 @@ class MaskRCNNMaskHead(head.Head):
                mask_width=14,
                mask_prediction_num_conv_layers=2,
                mask_prediction_conv_depth=256,
-               masks_are_class_agnostic=False):
+               masks_are_class_agnostic=False,
+               convolve_then_upsample=False):
     """Constructor.
 
     Args:
@@ -62,6 +69,10 @@ class MaskRCNNMaskHead(head.Head):
         image features.
       masks_are_class_agnostic: Boolean determining if the mask-head is
         class-agnostic or not.
+      convolve_then_upsample: Whether to apply convolutions on mask features
+        before upsampling using nearest neighbor resizing. Otherwise, mask
+        features are resized to [`mask_height`, `mask_width`] using bilinear
+        resizing before applying convolutions.
 
     Raises:
       ValueError: conv_hyperparams_fn is None.
@@ -74,6 +85,7 @@ class MaskRCNNMaskHead(head.Head):
     self._mask_prediction_num_conv_layers = mask_prediction_num_conv_layers
     self._mask_prediction_conv_depth = mask_prediction_conv_depth
     self._masks_are_class_agnostic = masks_are_class_agnostic
+    self._convolve_then_upsample = convolve_then_upsample
     if conv_hyperparams_fn is None:
       raise ValueError('conv_hyperparams_fn is None.')
 
@@ -135,17 +147,30 @@ class MaskRCNNMaskHead(head.Head):
       num_conv_channels = self._get_mask_predictor_conv_depth(
           num_feature_channels, self._num_classes)
     with slim.arg_scope(self._conv_hyperparams_fn()):
-      upsampled_features = tf.image.resize_bilinear(
-          features, [self._mask_height, self._mask_width],
-          align_corners=True)
+      if not self._convolve_then_upsample:
+        features = tf.image.resize_bilinear(
+            features, [self._mask_height, self._mask_width],
+            align_corners=True)
       for _ in range(self._mask_prediction_num_conv_layers - 1):
-        upsampled_features = slim.conv2d(
-            upsampled_features,
+        features = slim.conv2d(
+            features,
             num_outputs=num_conv_channels,
             kernel_size=[3, 3])
+      if self._convolve_then_upsample:
+        # Replace Transposed Convolution with a Nearest Neighbor upsampling step
+        # followed by 3x3 convolution.
+        height_scale = self._mask_height // features.shape[1].value
+        width_scale = self._mask_width // features.shape[2].value
+        features = ops.nearest_neighbor_upsampling(
+            features, height_scale=height_scale, width_scale=width_scale)
+        features = slim.conv2d(
+            features,
+            num_outputs=num_conv_channels,
+            kernel_size=[3, 3])
+
       num_masks = 1 if self._masks_are_class_agnostic else self._num_classes
       mask_predictions = slim.conv2d(
-          upsampled_features,
+          features,
           num_outputs=num_masks,
           activation_fn=None,
           normalizer_fn=None,

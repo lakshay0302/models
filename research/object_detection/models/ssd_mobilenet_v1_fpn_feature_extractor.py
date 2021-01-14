@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,9 +16,15 @@
 
 """SSD MobilenetV1 FPN Feature Extractor."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import copy
 import functools
-import tensorflow as tf
+from six.moves import range
+import tensorflow.compat.v1 as tf
+import tf_slim as slim
 
 from object_detection.meta_architectures import ssd_meta_arch
 from object_detection.models import feature_map_generators
@@ -26,16 +33,13 @@ from object_detection.utils import ops
 from object_detection.utils import shape_utils
 from nets import mobilenet_v1
 
-slim = tf.contrib.slim
-
 
 # A modified config of mobilenet v1 that makes it more detection friendly,
 def _create_modified_mobilenet_config():
-  conv_defs = copy.copy(mobilenet_v1.MOBILENETV1_CONV_DEFS)
+  conv_defs = copy.deepcopy(mobilenet_v1.MOBILENETV1_CONV_DEFS)
   conv_defs[-2] = mobilenet_v1.DepthSepConv(kernel=[3, 3], stride=2, depth=512)
   conv_defs[-1] = mobilenet_v1.DepthSepConv(kernel=[3, 3], stride=1, depth=256)
   return conv_defs
-_CONV_DEFS = _create_modified_mobilenet_config()
 
 
 class SSDMobileNetV1FpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
@@ -53,6 +57,7 @@ class SSDMobileNetV1FpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
                reuse_weights=None,
                use_explicit_padding=False,
                use_depthwise=False,
+               use_native_resize_op=False,
                override_base_feature_extractor_hyperparams=False):
     """SSD FPN feature extractor based on Mobilenet v1 architecture.
 
@@ -80,6 +85,8 @@ class SSDMobileNetV1FpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
       use_explicit_padding: Whether to use explicit padding when extracting
         features. Default is False.
       use_depthwise: Whether to use depthwise convolutions. Default is False.
+      use_native_resize_op: Whether to use tf.image.nearest_neighbor_resize
+        to do upsampling in FPN. Default is false.
       override_base_feature_extractor_hyperparams: Whether to override
         hyperparameters of the base feature extractor with the one from
         `conv_hyperparams_fn`.
@@ -98,6 +105,10 @@ class SSDMobileNetV1FpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
     self._fpn_min_level = fpn_min_level
     self._fpn_max_level = fpn_max_level
     self._additional_layer_depth = additional_layer_depth
+    self._conv_defs = None
+    if self._use_depthwise:
+      self._conv_defs = _create_modified_mobilenet_config()
+    self._use_native_resize_op = use_native_resize_op
 
   def preprocess(self, resized_inputs):
     """SSD preprocessing.
@@ -141,7 +152,7 @@ class SSDMobileNetV1FpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
               final_endpoint='Conv2d_13_pointwise',
               min_depth=self._min_depth,
               depth_multiplier=self._depth_multiplier,
-              conv_defs=_CONV_DEFS if self._use_depthwise else None,
+              conv_defs=self._conv_defs,
               use_explicit_padding=self._use_explicit_padding,
               scope=scope)
 
@@ -159,7 +170,9 @@ class SSDMobileNetV1FpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
           fpn_features = feature_map_generators.fpn_top_down_feature_maps(
               [(key, image_features[key]) for key in feature_block_list],
               depth=depth_fn(self._additional_layer_depth),
-              use_depthwise=self._use_depthwise)
+              use_depthwise=self._use_depthwise,
+              use_explicit_padding=self._use_explicit_padding,
+              use_native_resize_op=self._use_native_resize_op)
           feature_maps = []
           for level in range(self._fpn_min_level, base_fpn_max_level + 1):
             feature_maps.append(fpn_features['top_down_{}'.format(
@@ -167,18 +180,23 @@ class SSDMobileNetV1FpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
           last_feature_map = fpn_features['top_down_{}'.format(
               feature_blocks[base_fpn_max_level - 2])]
           # Construct coarse features
+          padding = 'VALID' if self._use_explicit_padding else 'SAME'
+          kernel_size = 3
           for i in range(base_fpn_max_level + 1, self._fpn_max_level + 1):
             if self._use_depthwise:
               conv_op = functools.partial(
                   slim.separable_conv2d, depth_multiplier=1)
             else:
               conv_op = slim.conv2d
+            if self._use_explicit_padding:
+              last_feature_map = ops.fixed_padding(
+                  last_feature_map, kernel_size)
             last_feature_map = conv_op(
                 last_feature_map,
                 num_outputs=depth_fn(self._additional_layer_depth),
-                kernel_size=[3, 3],
+                kernel_size=[kernel_size, kernel_size],
                 stride=2,
-                padding='SAME',
+                padding=padding,
                 scope='bottom_up_Conv2d_{}'.format(i - base_fpn_max_level + 13))
             feature_maps.append(last_feature_map)
     return feature_maps
